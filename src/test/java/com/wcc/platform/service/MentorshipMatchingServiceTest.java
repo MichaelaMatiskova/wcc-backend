@@ -1,9 +1,13 @@
 package com.wcc.platform.service;
 
 import static com.wcc.platform.utils.MenteeApplicationTestBuilder.baseBuilder;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -204,5 +208,139 @@ class MentorshipMatchingServiceTest {
     assertThatThrownBy(() -> service.confirmMatch(APPLICATION_ID))
         .isInstanceOf(IllegalStateException.class)
         .hasMessageContaining("MENTOR_ACCEPTED");
+  }
+
+  @Test
+  @DisplayName(
+      "Given an active match, when completing it, then update the match and notify listeners")
+  void shouldCompleteActiveMatch() {
+    var match = activeMatch();
+    var updatedMatch = matchWithStatus(MatchStatus.COMPLETED, 0);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+    when(matchRepository.update(eq(MATCH_ID), any(MentorshipMatch.class))).thenReturn(updatedMatch);
+
+    var result = service.completeMatch(MATCH_ID, "Goals achieved");
+
+    assertThat(result).isSameAs(updatedMatch);
+    verify(matchRepository).update(eq(MATCH_ID), any(MentorshipMatch.class));
+    verify(notificationService)
+        .sendMatchUpdate(
+            eq(Optional.of(match)),
+            argThat(updated -> updated.getStatus() == MatchStatus.COMPLETED));
+  }
+
+  @Test
+  @DisplayName(
+      "Given a completed match, when completing it again, then reject the invalid transition")
+  void shouldRejectCompletingNonActiveMatch() {
+    var match = matchWithStatus(MatchStatus.COMPLETED, 0);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+
+    assertThatThrownBy(() -> service.completeMatch(MATCH_ID, "Already completed"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("ACTIVE");
+
+    verify(matchRepository, never()).update(any(), any());
+  }
+
+  @Test
+  @DisplayName(
+      "Given an active match, when cancelling it, then persist cancellation details and notify")
+  void shouldCancelActiveMatch() {
+    var match = activeMatch();
+    var updatedMatch = matchWithStatus(MatchStatus.CANCELLED, 0);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+    when(matchRepository.update(eq(MATCH_ID), any(MentorshipMatch.class))).thenReturn(updatedMatch);
+
+    var result = service.cancelMatch(MATCH_ID, "Schedule conflict", "MENTEE");
+
+    assertThat(result).isSameAs(updatedMatch);
+    verify(matchRepository).update(eq(MATCH_ID), any(MentorshipMatch.class));
+    verify(notificationService)
+        .sendMatchUpdate(
+            eq(Optional.of(match)),
+            argThat(
+                updated ->
+                    updated.getStatus() == MatchStatus.CANCELLED
+                        && "Schedule conflict".equals(updated.getCancellationReason())
+                        && "MENTEE".equals(updated.getCancelledBy())));
+  }
+
+  @Test
+  @DisplayName("Given a cancelled match, when cancelling it again, then reject the terminal state")
+  void shouldRejectCancellingTerminalMatch() {
+    var match = matchWithStatus(MatchStatus.CANCELLED, 0);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+
+    assertThatThrownBy(() -> service.cancelMatch(MATCH_ID, "Duplicate request", "ADMIN"))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("terminal state");
+
+    verify(matchRepository, never()).update(any(), any());
+  }
+
+  @Test
+  @DisplayName("Given an active match, when incrementing sessions, then increase the session count")
+  void shouldIncrementSessionCountForActiveMatch() {
+    var match = matchWithStatus(MatchStatus.ACTIVE, 2);
+    var updatedMatch = matchWithStatus(MatchStatus.ACTIVE, 3);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+    when(matchRepository.update(eq(MATCH_ID), any(MentorshipMatch.class))).thenReturn(updatedMatch);
+
+    var result = service.incrementSessionCount(MATCH_ID);
+
+    assertThat(result).isSameAs(updatedMatch);
+    verify(matchRepository).update(eq(MATCH_ID), any(MentorshipMatch.class));
+  }
+
+  @Test
+  @DisplayName("Given a completed match, when incrementing sessions, then reject session tracking")
+  void shouldRejectIncrementingSessionCountForInactiveMatch() {
+    var match = matchWithStatus(MatchStatus.COMPLETED, 2);
+    when(matchRepository.findById(MATCH_ID)).thenReturn(Optional.of(match));
+
+    assertThatThrownBy(() -> service.incrementSessionCount(MATCH_ID))
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("active matches");
+
+    verify(matchRepository, never()).update(any(), any());
+  }
+
+  @Test
+  @DisplayName(
+      "Given match repository queries, when retrieving matches, then delegate and return results")
+  void shouldDelegateMatchRetrievalQueries() {
+    var match = activeMatch();
+    var matches = List.of(match);
+    when(matchRepository.findActiveMenteesByMentor(MENTOR_ID)).thenReturn(matches);
+    when(matchRepository.findActiveMentorByMentee(MENTEE_ID)).thenReturn(Optional.of(match));
+    when(matchRepository.findByCycle(CYCLE_ID)).thenReturn(matches);
+
+    assertThat(service.getActiveMentorMatches(MENTOR_ID)).containsExactly(match);
+    assertThat(service.getActiveMenteeMatch(MENTEE_ID)).isSameAs(match);
+    assertThat(service.getCycleMatches(CYCLE_ID)).containsExactly(match);
+
+    verify(matchRepository).findActiveMenteesByMentor(MENTOR_ID);
+    verify(matchRepository).findActiveMentorByMentee(MENTEE_ID);
+    verify(matchRepository).findByCycle(CYCLE_ID);
+  }
+
+  private MentorshipMatch activeMatch() {
+    return matchWithStatus(MatchStatus.ACTIVE, 0);
+  }
+
+  private MentorshipMatch matchWithStatus(final MatchStatus status, final int totalSessions) {
+    return MentorshipMatch.builder()
+        .matchId(MATCH_ID)
+        .mentorId(MENTOR_ID)
+        .menteeId(MENTEE_ID)
+        .cycleId(CYCLE_ID)
+        .applicationId(APPLICATION_ID)
+        .status(status)
+        .startDate(FIXED_DATE)
+        .expectedEndDate(FIXED_DATE.plusMonths(6))
+        .sessionFrequency("Weekly")
+        .totalSessions(totalSessions)
+        .build();
   }
 }
